@@ -68,9 +68,7 @@ import (
 	"github.com/rcarmo/go-busybox/pkg/core"
 )
 
-type appletFunc func(stdio *core.Stdio, args []string) int
-
-var applets = map[string]appletFunc{
+var applets = map[string]core.AppletFunc{
 	"echo":              echo.Run,
 	"ash":               ash.Run,
 	"sh":                ash.Run,
@@ -129,6 +127,13 @@ var applets = map[string]appletFunc{
 	"start-stop-daemon": startstopdaemon.Run,
 	"wget":              wget.Run,
 	"nc":                nc.Run,
+}
+
+func init() {
+	// Register all applets in the core registry so ash can dispatch them in-process.
+	for name, run := range applets {
+		core.RegisterApplet(name, run)
+	}
 }
 
 func main() {
