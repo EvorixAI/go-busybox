@@ -2,7 +2,7 @@
 
 // WASI-compatible ash shell implementation.
 // Uses in-process applet dispatch via core.ExecCommand instead of os/exec.
-// Supports: command execution, pipelines, redirections (>, >>, <),
+// Supports: command execution, pipelines, redirections (>, >>, <, 2>),
 // environment variables, builtins (cd, export, set, exit, etc.),
 // command substitution ($(...)), and basic control flow.
 
@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/rcarmo/go-busybox/pkg/core"
 )
@@ -115,14 +116,14 @@ func (s *wasiShell) execLine(line string) {
 	}
 
 	// Handle && and || chains
-	if strings.Contains(line, "&&") || strings.Contains(line, "||") {
+	if containsUnquoted(line, "&&") || containsUnquoted(line, "||") {
 		s.execChain(line)
 		return
 	}
 
 	// Handle ; separated commands
-	if strings.Contains(line, ";") && !strings.Contains(line, "'") {
-		for _, part := range splitOnSemicolon(line) {
+	if containsUnquoted(line, ";") {
+		for _, part := range splitUnquoted(line, ';') {
 			part = strings.TrimSpace(part)
 			if part != "" {
 				s.execSingle(part)
@@ -135,7 +136,6 @@ func (s *wasiShell) execLine(line string) {
 }
 
 func (s *wasiShell) execChain(line string) {
-	// Simple && / || chain handling
 	parts := tokenizeChain(line)
 	for _, part := range parts {
 		cmd := strings.TrimSpace(part.cmd)
@@ -154,27 +154,38 @@ func (s *wasiShell) execChain(line string) {
 
 type chainPart struct {
 	cmd string
-	op  string // "" for first, "&&" or "||"
+	op  string
 }
 
 func tokenizeChain(line string) []chainPart {
 	var parts []chainPart
 	current := ""
 	op := ""
+	inSingle, inDouble := false, false
 	for i := 0; i < len(line); i++ {
-		if i+1 < len(line) && line[i:i+2] == "&&" {
-			parts = append(parts, chainPart{cmd: current, op: op})
-			current = ""
-			op = "&&"
-			i++
-		} else if i+1 < len(line) && line[i:i+2] == "||" {
-			parts = append(parts, chainPart{cmd: current, op: op})
-			current = ""
-			op = "||"
-			i++
-		} else {
-			current += string(line[i])
+		ch := line[i]
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+		} else if ch == '"' && !inSingle {
+			inDouble = !inDouble
 		}
+		if !inSingle && !inDouble && i+1 < len(line) {
+			if line[i:i+2] == "&&" {
+				parts = append(parts, chainPart{cmd: current, op: op})
+				current = ""
+				op = "&&"
+				i++
+				continue
+			}
+			if line[i:i+2] == "||" {
+				parts = append(parts, chainPart{cmd: current, op: op})
+				current = ""
+				op = "||"
+				i++
+				continue
+			}
+		}
+		current += string(ch)
 	}
 	parts = append(parts, chainPart{cmd: current, op: op})
 	return parts
@@ -188,13 +199,18 @@ func (s *wasiShell) execSingle(line string) {
 	line = s.expandCommandSubstitution(line)
 
 	// Check for pipeline
-	if strings.Contains(line, "|") && !isQuoted(line, strings.Index(line, "|")) {
+	if containsUnquoted(line, "|") {
 		s.execPipeline(line)
 		return
 	}
 
+	s.execSimple(line)
+}
+
+// execSimple runs a single command (no pipes).
+func (s *wasiShell) execSimple(line string) {
 	// Parse redirections
-	args, stdinFile, stdoutFile, stdoutAppend, stderrFile := parseRedirections(line)
+	args, stdinFile, stdoutFile, stdoutAppend, stderrRedir := parseRedirections(line)
 	if len(args) == 0 {
 		return
 	}
@@ -202,11 +218,8 @@ func (s *wasiShell) execSingle(line string) {
 	// Handle variable assignment: VAR=value
 	if len(args) == 1 && strings.Contains(args[0], "=") && !strings.HasPrefix(args[0], "=") {
 		eq := strings.Index(args[0], "=")
-		name := args[0][:eq]
-		val := args[0][eq+1:]
-		s.vars[name] = val
-		s.lastExit = 0
-		s.vars["?"] = "0"
+		s.vars[args[0][:eq]] = args[0][eq+1:]
+		s.setExit(0)
 		return
 	}
 
@@ -215,6 +228,8 @@ func (s *wasiShell) execSingle(line string) {
 	stdout := s.stdio.Out
 	stderr := s.stdio.Err
 
+	var closers []io.Closer
+
 	if stdinFile != "" {
 		f, err := os.Open(stdinFile)
 		if err != nil {
@@ -222,7 +237,7 @@ func (s *wasiShell) execSingle(line string) {
 			s.setExit(1)
 			return
 		}
-		defer f.Close()
+		closers = append(closers, f)
 		stdin = f
 	}
 
@@ -237,22 +252,37 @@ func (s *wasiShell) execSingle(line string) {
 		if err != nil {
 			s.stdio.Errorf("ash: %v\n", err)
 			s.setExit(1)
+			for _, c := range closers {
+				c.Close()
+			}
 			return
 		}
-		defer f.Close()
+		closers = append(closers, f)
 		stdout = f
+		if stderrRedir == "&1" {
+			stderr = f
+		}
 	}
 
-	if stderrFile != "" {
-		f, err := os.OpenFile(stderrFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if stderrRedir != "" && stderrRedir != "&1" {
+		f, err := os.OpenFile(stderrRedir, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 		if err != nil {
 			s.stdio.Errorf("ash: %v\n", err)
 			s.setExit(1)
+			for _, c := range closers {
+				c.Close()
+			}
 			return
 		}
-		defer f.Close()
+		closers = append(closers, f)
 		stderr = f
 	}
+
+	defer func() {
+		for _, c := range closers {
+			c.Close()
+		}
+	}()
 
 	// Try builtin first
 	if s.tryBuiltin(args, stdin, stdout, stderr) {
@@ -260,86 +290,124 @@ func (s *wasiShell) execSingle(line string) {
 	}
 
 	// Execute via core executor (applet registry)
-	env := s.buildEnv()
-	exitCode := core.ExecCommand(args[0], args[1:], stdin, stdout, stderr, env)
+	exitCode := core.ExecCommand(args[0], args[1:], stdin, stdout, stderr, s.buildEnv())
 	s.setExit(exitCode)
 }
 
+// runCommand runs a single command (possibly a builtin) with given I/O.
+// Used by pipeline stages.
+func (s *wasiShell) runCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		return 0
+	}
+
+	// Check builtins (only the ones that make sense in a pipeline)
+	switch args[0] {
+	case "echo":
+		s.builtinEcho(args[1:], stdout)
+		return s.lastExit
+	case "set":
+		s.builtinSet(stdout)
+		return s.lastExit
+	case "env":
+		for _, e := range s.buildEnv() {
+			fmt.Fprintln(stdout, e)
+		}
+		return 0
+	case "pwd":
+		dir, _ := os.Getwd()
+		fmt.Fprintln(stdout, dir)
+		return 0
+	case "true":
+		return 0
+	case "false":
+		return 1
+	case "type":
+		s.builtinType(args[1:], stdout)
+		return s.lastExit
+	case "read":
+		s.builtinRead(args[1:], stdin)
+		return s.lastExit
+	case "cat":
+		// cat without args reads from stdin (useful in pipes)
+		if len(args) == 1 {
+			io.Copy(stdout, stdin)
+			return 0
+		}
+	}
+
+	// Execute via core executor
+	return core.ExecCommand(args[0], args[1:], stdin, stdout, stderr, s.buildEnv())
+}
+
 func (s *wasiShell) execPipeline(line string) {
-	segments := splitPipeline(line)
+	segments := splitUnquoted(line, '|')
 	if len(segments) == 0 {
 		return
 	}
 	if len(segments) == 1 {
-		s.execSingle(segments[0])
+		s.execSimple(segments[0])
 		return
 	}
 
-	// Build pipeline with io.Pipe between each stage
-	var prevReader io.Reader = s.stdio.In
-	env := s.buildEnv()
-
-	type pipeStage struct {
-		done chan int
-		pw   *io.PipeWriter
+	// Parse all stages
+	type stage struct {
+		args []string
 	}
-	stages := make([]pipeStage, len(segments))
+	var stages []stage
+	for _, seg := range segments {
+		seg = strings.TrimSpace(s.expandVars(seg))
+		args, _, _, _, _ := parseRedirections(seg)
+		stages = append(stages, stage{args: args})
+	}
 
-	for i, seg := range segments {
-		seg = strings.TrimSpace(seg)
-		args, _, _, _, _ := parseRedirections(s.expandVars(seg))
-		if len(args) == 0 {
-			continue
-		}
+	// Execute pipeline: each stage runs in a goroutine.
+	// io.Pipe connects them. We close write ends promptly.
+	n := len(stages)
+	pipes := make([]*io.PipeWriter, n-1)
+	readers := make([]*io.PipeReader, n-1)
+	for i := 0; i < n-1; i++ {
+		r, w := io.Pipe()
+		readers[i] = r
+		pipes[i] = w
+	}
 
-		var stdout io.Writer
-		var pw *io.PipeWriter
-		if i < len(segments)-1 {
-			pr, pipeW := io.Pipe()
-			pw = pipeW
-			stdout = pipeW
-			// Next stage reads from this pipe
-			stageReader := prevReader
-			prevReader = pr
-			_ = stageReader // used as stdin for this stage below
-		} else {
-			stdout = s.stdio.Out
-		}
+	var wg sync.WaitGroup
+	exitCodes := make([]int, n)
 
-		stageStdin := prevReader
-		if i > 0 {
-			// For stages after the first, stdin comes from the previous pipe
-			stageStdin = prevReader
-		} else {
-			stageStdin = s.stdio.In
-		}
+	for i, st := range stages {
+		var stageIn io.Reader
+		var stageOut io.Writer
 
-		// Fix: for stage i, stdin is the reader from previous stage
 		if i == 0 {
-			stageStdin = s.stdio.In
+			stageIn = s.stdio.In
+		} else {
+			stageIn = readers[i-1]
 		}
 
-		_, done := core.StartCommandAsync(args[0], args[1:], stageStdin, stdout, s.stdio.Err, env)
-		stages[i] = pipeStage{done: done, pw: pw}
-
-		if i < len(segments)-1 {
-			// After starting this stage, the next stage's stdin is the pipe reader
-			// prevReader was already set above
+		if i == n-1 {
+			stageOut = s.stdio.Out
+		} else {
+			stageOut = pipes[i]
 		}
-	}
 
-	// Wait for all stages, close pipes as each completes
-	for i, stage := range stages {
-		if stage.done != nil {
-			exitCode := <-stage.done
-			if i == len(segments)-1 {
-				s.setExit(exitCode)
+		wg.Add(1)
+		go func(idx int, args []string, in io.Reader, out io.Writer) {
+			defer wg.Done()
+			exitCodes[idx] = s.runCommand(args, in, out, s.stdio.Err)
+			// Close the write end of our pipe so the next stage gets EOF
+			if idx < n-1 {
+				pipes[idx].Close()
 			}
-		}
-		if stage.pw != nil {
-			stage.pw.Close()
-		}
+			// Close the read end we consumed
+			if idx > 0 {
+				readers[idx-1].Close()
+			}
+		}(i, st.args, stageIn, stageOut)
 	}
+
+	wg.Wait()
+	s.setExit(exitCodes[n-1])
 }
 
 // MARK: - Builtins
@@ -461,15 +529,27 @@ func (s *wasiShell) builtinSet(stdout io.Writer) {
 
 func (s *wasiShell) builtinEcho(args []string, stdout io.Writer) {
 	noNewline := false
+	interpretEscapes := false
 	startIdx := 0
-	if len(args) > 0 && args[0] == "-n" {
-		noNewline = true
-		startIdx = 1
+	for startIdx < len(args) {
+		if args[startIdx] == "-n" {
+			noNewline = true
+			startIdx++
+		} else if args[startIdx] == "-e" {
+			interpretEscapes = true
+			startIdx++
+		} else if args[startIdx] == "-ne" || args[startIdx] == "-en" {
+			noNewline = true
+			interpretEscapes = true
+			startIdx++
+		} else {
+			break
+		}
 	}
 	output := strings.Join(args[startIdx:], " ")
-	// Handle \n, \t escape sequences
-	output = strings.ReplaceAll(output, "\\n", "\n")
-	output = strings.ReplaceAll(output, "\\t", "\t")
+	if interpretEscapes {
+		output = interpretEscapeSequences(output)
+	}
 	fmt.Fprint(stdout, output)
 	if !noNewline {
 		fmt.Fprintln(stdout)
@@ -477,8 +557,40 @@ func (s *wasiShell) builtinEcho(args []string, stdout io.Writer) {
 	s.setExit(0)
 }
 
+func interpretEscapeSequences(s string) string {
+	var buf strings.Builder
+	i := 0
+	for i < len(s) {
+		if s[i] == '\\' && i+1 < len(s) {
+			switch s[i+1] {
+			case 'n':
+				buf.WriteByte('\n')
+				i += 2
+			case 't':
+				buf.WriteByte('\t')
+				i += 2
+			case 'r':
+				buf.WriteByte('\r')
+				i += 2
+			case '\\':
+				buf.WriteByte('\\')
+				i += 2
+			case '0':
+				buf.WriteByte(0)
+				i += 2
+			default:
+				buf.WriteByte(s[i])
+				i++
+			}
+		} else {
+			buf.WriteByte(s[i])
+			i++
+		}
+	}
+	return buf.String()
+}
+
 func (s *wasiShell) builtinTest(args []string) int {
-	// Minimal test/[ implementation
 	if args[0] == "[" {
 		if len(args) < 2 || args[len(args)-1] != "]" {
 			return 2
@@ -517,18 +629,25 @@ func (s *wasiShell) builtinTest(args []string) int {
 				return 0
 			}
 			return 1
-		case "-e":
+		case "-e", "-r", "-w", "-x":
 			_, err := os.Stat(args[1])
 			if err == nil {
 				return 0
 			}
 			return 1
-		case "-r", "-w", "-x":
-			_, err := os.Stat(args[1])
-			if err == nil {
+		case "-s":
+			info, err := os.Stat(args[1])
+			if err == nil && info.Size() > 0 {
 				return 0
 			}
 			return 1
+		case "!":
+			// Negate single test
+			sub := s.builtinTest(append([]string{"test"}, args[1:]...))
+			if sub == 0 {
+				return 1
+			}
+			return 0
 		}
 	}
 
@@ -545,6 +664,16 @@ func (s *wasiShell) builtinTest(args []string) int {
 				return 0
 			}
 			return 1
+		case "-eq":
+			if args[0] == args[2] {
+				return 0
+			}
+			return 1
+		case "-ne":
+			if args[0] != args[2] {
+				return 0
+			}
+			return 1
 		}
 	}
 
@@ -556,19 +685,20 @@ func (s *wasiShell) builtinTest(args []string) int {
 }
 
 func (s *wasiShell) builtinType(args []string, stdout io.Writer) {
+	builtins := map[string]bool{
+		"cd": true, "pwd": true, "export": true, "unset": true, "set": true,
+		"env": true, "exit": true, "true": true, "false": true, "echo": true,
+		"test": true, "[": true, "type": true, "read": true, "source": true, ".": true,
+	}
 	for _, name := range args {
-		switch name {
-		case "cd", "pwd", "export", "unset", "set", "env", "exit", "true", "false",
-			"echo", "test", "[", "type", "read", "source", ".":
+		if builtins[name] {
 			fmt.Fprintf(stdout, "%s is a shell builtin\n", name)
-		default:
-			if core.IsExecutable(name) {
-				fmt.Fprintf(stdout, "%s is a busybox applet\n", name)
-			} else {
-				fmt.Fprintf(stdout, "ash: type: %s: not found\n", name)
-				s.setExit(1)
-				return
-			}
+		} else if core.IsExecutable(name) {
+			fmt.Fprintf(stdout, "%s is a busybox applet\n", name)
+		} else {
+			fmt.Fprintf(stdout, "ash: type: %s: not found\n", name)
+			s.setExit(1)
+			return
 		}
 	}
 	s.setExit(0)
@@ -589,7 +719,6 @@ func (s *wasiShell) builtinRead(args []string, stdin io.Reader) {
 		for i, name := range args {
 			if i < len(fields) {
 				if i == len(args)-1 {
-					// Last var gets remainder
 					s.vars[name] = strings.Join(fields[i:], " ")
 				} else {
 					s.vars[name] = fields[i]
@@ -609,7 +738,6 @@ func (s *wasiShell) expandVars(input string) string {
 	i := 0
 	for i < len(input) {
 		if input[i] == '\'' {
-			// Single-quoted: no expansion
 			end := strings.Index(input[i+1:], "'")
 			if end < 0 {
 				result.WriteString(input[i:])
@@ -619,7 +747,6 @@ func (s *wasiShell) expandVars(input string) string {
 			i += 2 + end
 		} else if input[i] == '$' {
 			if i+1 < len(input) && input[i+1] == '{' {
-				// ${VAR} or ${VAR:-default}
 				end := strings.Index(input[i:], "}")
 				if end < 0 {
 					result.WriteByte(input[i])
@@ -630,11 +757,10 @@ func (s *wasiShell) expandVars(input string) string {
 				result.WriteString(s.expandParameter(expr))
 				i += end + 1
 			} else if i+1 < len(input) && input[i+1] == '(' {
-				// $(...) — handled separately in expandCommandSubstitution
+				// $(...) — handled by expandCommandSubstitution
 				result.WriteByte(input[i])
 				i++
 			} else if i+1 < len(input) && (input[i+1] == '?' || isVarChar(input[i+1])) {
-				// $VAR or $?
 				j := i + 1
 				if input[j] == '?' {
 					j++
@@ -719,80 +845,39 @@ func (s *wasiShell) expandCommandSubstitution(input string) string {
 
 // MARK: - Parsing Helpers
 
-func parseRedirections(line string) (args []string, stdinFile, stdoutFile string, stdoutAppend bool, stderrFile string) {
+func parseRedirections(line string) (args []string, stdinFile, stdoutFile string, stdoutAppend bool, stderrRedir string) {
 	tokens := shellSplit(line)
 	var cleanArgs []string
 	for i := 0; i < len(tokens); i++ {
+		tok := tokens[i]
 		switch {
-		case tokens[i] == "<" && i+1 < len(tokens):
+		case tok == "<" && i+1 < len(tokens):
 			stdinFile = tokens[i+1]
 			i++
-		case tokens[i] == ">" && i+1 < len(tokens):
-			stdoutFile = tokens[i+1]
-			stdoutAppend = false
-			i++
-		case tokens[i] == ">>" && i+1 < len(tokens):
+		case tok == ">>" && i+1 < len(tokens):
 			stdoutFile = tokens[i+1]
 			stdoutAppend = true
 			i++
-		case tokens[i] == "2>" && i+1 < len(tokens):
-			stderrFile = tokens[i+1]
-			i++
-		case strings.HasPrefix(tokens[i], ">"):
-			stdoutFile = tokens[i][1:]
+		case tok == ">" && i+1 < len(tokens):
+			stdoutFile = tokens[i+1]
 			stdoutAppend = false
-		case strings.HasPrefix(tokens[i], ">>"):
-			stdoutFile = tokens[i][2:]
+			i++
+		case tok == "2>&1":
+			stderrRedir = "&1"
+		case tok == "2>" && i+1 < len(tokens):
+			stderrRedir = tokens[i+1]
+			i++
+		case strings.HasPrefix(tok, ">>"):
+			stdoutFile = tok[2:]
 			stdoutAppend = true
+		case strings.HasPrefix(tok, ">") && len(tok) > 1:
+			stdoutFile = tok[1:]
+			stdoutAppend = false
 		default:
-			cleanArgs = append(cleanArgs, tokens[i])
+			cleanArgs = append(cleanArgs, tok)
 		}
 	}
-	return cleanArgs, stdinFile, stdoutFile, stdoutAppend, stderrFile
-}
-
-func splitPipeline(line string) []string {
-	var segments []string
-	current := ""
-	inSingle := false
-	inDouble := false
-	for _, ch := range line {
-		if ch == '\'' && !inDouble {
-			inSingle = !inSingle
-		} else if ch == '"' && !inSingle {
-			inDouble = !inDouble
-		}
-		if ch == '|' && !inSingle && !inDouble {
-			segments = append(segments, current)
-			current = ""
-		} else {
-			current += string(ch)
-		}
-	}
-	segments = append(segments, current)
-	return segments
-}
-
-func splitOnSemicolon(line string) []string {
-	var parts []string
-	current := ""
-	inSingle := false
-	inDouble := false
-	for _, ch := range line {
-		if ch == '\'' && !inDouble {
-			inSingle = !inSingle
-		} else if ch == '"' && !inSingle {
-			inDouble = !inDouble
-		}
-		if ch == ';' && !inSingle && !inDouble {
-			parts = append(parts, current)
-			current = ""
-		} else {
-			current += string(ch)
-		}
-	}
-	parts = append(parts, current)
-	return parts
+	return cleanArgs, stdinFile, stdoutFile, stdoutAppend, stderrRedir
 }
 
 // shellSplit splits a command line into tokens, respecting quotes.
@@ -803,13 +888,27 @@ func shellSplit(line string) []string {
 	inDouble := false
 	escaped := false
 
-	for _, ch := range line {
+	for i := 0; i < len(line); i++ {
+		ch := rune(line[i])
 		if escaped {
 			current.WriteRune(ch)
 			escaped = false
 			continue
 		}
 		if ch == '\\' && !inSingle {
+			if inDouble {
+				// In double quotes, only \\ \" \$ \` are special
+				if i+1 < len(line) {
+					next := line[i+1]
+					if next == '\\' || next == '"' || next == '$' || next == '`' {
+						escaped = true
+						continue
+					}
+				}
+				// Preserve the backslash for other sequences (e.g. \n \t)
+				current.WriteRune(ch)
+				continue
+			}
 			escaped = true
 			continue
 		}
@@ -849,17 +948,43 @@ func shellSplit(line string) []string {
 	return expanded
 }
 
-func isQuoted(line string, pos int) bool {
-	inSingle := false
-	inDouble := false
-	for i := 0; i < pos && i < len(line); i++ {
+// containsUnquoted checks if `sub` appears outside of quotes in `line`.
+func containsUnquoted(line, sub string) bool {
+	inSingle, inDouble := false, false
+	for i := 0; i < len(line); i++ {
 		if line[i] == '\'' && !inDouble {
 			inSingle = !inSingle
 		} else if line[i] == '"' && !inSingle {
 			inDouble = !inDouble
 		}
+		if !inSingle && !inDouble && i+len(sub) <= len(line) && line[i:i+len(sub)] == sub {
+			return true
+		}
 	}
-	return inSingle || inDouble
+	return false
+}
+
+// splitUnquoted splits on a delimiter character, respecting quotes.
+func splitUnquoted(line string, delim byte) []string {
+	var parts []string
+	var current strings.Builder
+	inSingle, inDouble := false, false
+	for i := 0; i < len(line); i++ {
+		ch := line[i]
+		if ch == '\'' && !inDouble {
+			inSingle = !inSingle
+		} else if ch == '"' && !inSingle {
+			inDouble = !inDouble
+		}
+		if ch == delim && !inSingle && !inDouble {
+			parts = append(parts, current.String())
+			current.Reset()
+		} else {
+			current.WriteByte(ch)
+		}
+	}
+	parts = append(parts, current.String())
+	return parts
 }
 
 func isVarChar(b byte) bool {
