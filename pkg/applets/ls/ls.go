@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"os/user"
+
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
+
 	"time"
 
 	"github.com/rcarmo/go-busybox/pkg/core"
@@ -246,25 +246,8 @@ func printEntry(stdio *core.Stdio, name string, path string, info fs.FileInfo, o
 		}
 		timeStr := formatTime(modTime)
 
-		// Get link count, owner, group from syscall
-		nlink := uint64(1)
-		owner := "?"
-		group := "?"
-		if sys := info.Sys(); sys != nil {
-			if stat, ok := sys.(*syscall.Stat_t); ok {
-				nlink = stat.Nlink
-				if u, err := user.LookupId(fmt.Sprintf("%d", stat.Uid)); err == nil {
-					owner = u.Username
-				} else {
-					owner = fmt.Sprintf("%d", stat.Uid)
-				}
-				if g, err := user.LookupGroupId(fmt.Sprintf("%d", stat.Gid)); err == nil {
-					group = g.Name
-				} else {
-					group = fmt.Sprintf("%d", stat.Gid)
-				}
-			}
-		}
+		// Get link count, owner, group
+		nlink, owner, group := getStatInfo(info)
 
 		stdio.Printf("%s %2d %-8s %-8s %8s %s %s", mode.String(), nlink, owner, group, sizeStr, timeStr, displayName)
 	} else {
@@ -307,15 +290,8 @@ func formatTime(t time.Time) string {
 	return t.Format("Jan _2 15:04")
 }
 
-func getBlocks(path string, info fs.FileInfo) int64 {
-	if sys := info.Sys(); sys != nil {
-		if stat, ok := sys.(*syscall.Stat_t); ok {
-			// st_blocks is in 512-byte units; convert to 1024-byte
-			return stat.Blocks / 2
-		}
-	}
-	// Fallback: estimate from size (round up to 4K blocks)
-	return (info.Size() + 4095) / 4096 * 4
+func getBlocks(_ string, info fs.FileInfo) int64 {
+	return getBlocksFromStat(info)
 }
 
 func humanSize(size int64) string {
