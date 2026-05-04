@@ -10,11 +10,15 @@ import (
 
 	"github.com/rcarmo/go-busybox/pkg/applets/ash"
 	"github.com/rcarmo/go-busybox/pkg/applets/awk"
+	"github.com/rcarmo/go-busybox/pkg/applets/base64"
+	"github.com/rcarmo/go-busybox/pkg/applets/basename"
 	"github.com/rcarmo/go-busybox/pkg/applets/cat"
+	"github.com/rcarmo/go-busybox/pkg/applets/chmod"
 	"github.com/rcarmo/go-busybox/pkg/applets/cp"
 	"github.com/rcarmo/go-busybox/pkg/applets/cut"
 	"github.com/rcarmo/go-busybox/pkg/applets/diff"
 	"github.com/rcarmo/go-busybox/pkg/applets/dig"
+	"github.com/rcarmo/go-busybox/pkg/applets/dirname"
 	"github.com/rcarmo/go-busybox/pkg/applets/echo"
 	"github.com/rcarmo/go-busybox/pkg/applets/find"
 	"github.com/rcarmo/go-busybox/pkg/applets/free"
@@ -23,10 +27,13 @@ import (
 	"github.com/rcarmo/go-busybox/pkg/applets/gzip"
 	"github.com/rcarmo/go-busybox/pkg/applets/head"
 	"github.com/rcarmo/go-busybox/pkg/applets/ionice"
+	"github.com/rcarmo/go-busybox/pkg/applets/jq"
 	"github.com/rcarmo/go-busybox/pkg/applets/kill"
 	"github.com/rcarmo/go-busybox/pkg/applets/killall"
 	"github.com/rcarmo/go-busybox/pkg/applets/logname"
 	"github.com/rcarmo/go-busybox/pkg/applets/ls"
+	"github.com/rcarmo/go-busybox/pkg/applets/lua"
+	"github.com/rcarmo/go-busybox/pkg/applets/md5sum"
 	"github.com/rcarmo/go-busybox/pkg/applets/mkdir"
 	"github.com/rcarmo/go-busybox/pkg/applets/mv"
 	"github.com/rcarmo/go-busybox/pkg/applets/nc"
@@ -39,11 +46,14 @@ import (
 	"github.com/rcarmo/go-busybox/pkg/applets/pkill"
 	"github.com/rcarmo/go-busybox/pkg/applets/ps"
 	"github.com/rcarmo/go-busybox/pkg/applets/pwd"
+	"github.com/rcarmo/go-busybox/pkg/applets/qjs"
 	"github.com/rcarmo/go-busybox/pkg/applets/renice"
 	"github.com/rcarmo/go-busybox/pkg/applets/rm"
 	"github.com/rcarmo/go-busybox/pkg/applets/rmdir"
 	"github.com/rcarmo/go-busybox/pkg/applets/sed"
+	"github.com/rcarmo/go-busybox/pkg/applets/seq"
 	"github.com/rcarmo/go-busybox/pkg/applets/setsid"
+	"github.com/rcarmo/go-busybox/pkg/applets/sha256sum"
 	"github.com/rcarmo/go-busybox/pkg/applets/sleep"
 	"github.com/rcarmo/go-busybox/pkg/applets/sort"
 	"github.com/rcarmo/go-busybox/pkg/applets/ss"
@@ -51,9 +61,11 @@ import (
 	"github.com/rcarmo/go-busybox/pkg/applets/tail"
 	"github.com/rcarmo/go-busybox/pkg/applets/tar"
 	"github.com/rcarmo/go-busybox/pkg/applets/taskset"
+	"github.com/rcarmo/go-busybox/pkg/applets/tee"
 	"github.com/rcarmo/go-busybox/pkg/applets/time"
 	"github.com/rcarmo/go-busybox/pkg/applets/timeout"
 	"github.com/rcarmo/go-busybox/pkg/applets/top"
+	"github.com/rcarmo/go-busybox/pkg/applets/touch"
 	"github.com/rcarmo/go-busybox/pkg/applets/tr"
 	"github.com/rcarmo/go-busybox/pkg/applets/uniq"
 	"github.com/rcarmo/go-busybox/pkg/applets/uptime"
@@ -65,6 +77,8 @@ import (
 	"github.com/rcarmo/go-busybox/pkg/applets/who"
 	"github.com/rcarmo/go-busybox/pkg/applets/whoami"
 	"github.com/rcarmo/go-busybox/pkg/applets/xargs"
+	"github.com/rcarmo/go-busybox/pkg/applets/yes"
+	"github.com/rcarmo/go-busybox/pkg/applets/yq"
 	"github.com/rcarmo/go-busybox/pkg/core"
 )
 
@@ -127,6 +141,33 @@ var applets = map[string]core.AppletFunc{
 	"start-stop-daemon": startstopdaemon.Run,
 	"wget":              wget.Run,
 	"nc":                nc.Run,
+	// Tier 1 gap fill — Evorix additions for the WASI agent scripting
+	// toolkit, 2026-05-04. Pure-Go stdlib-only applets (no new deps).
+	"touch":     touch.Run,
+	"chmod":     chmod.Run,
+	"base64":    base64.Run,
+	"md5sum":    md5sum.Run,
+	"sha256sum": sha256sum.Run,
+	"basename":  basename.Run,
+	"dirname":   dirname.Run,
+	"tee":       tee.Run,
+	"seq":       seq.Run,
+	"yes":       yes.Run,
+	// Tier 2 — Evorix additions for the WASI agent scripting toolkit,
+	// 2026-05-04. Pure-Go wrappers around upstream libraries:
+	//   jq  → github.com/itchyny/gojq
+	//   qjs → github.com/dop251/goja (ES2020 interpreter)
+	//   lua → github.com/yuin/gopher-lua (Lua 5.1)
+	//   yq  → gopkg.in/yaml.v3 + gojq (jq-syntax over YAML)
+	//
+	// sqlite3 deferred: modernc.org/sqlite doesn't compile for wasip1
+	// (libc shim excludes pthread/signal/stdio/time/unistd). Pure-Go
+	// SQLite with WASI support doesn't exist today. Revisit when
+	// either modernc/sqlite gains WASI or an alternative emerges.
+	"jq":  jq.Run,
+	"qjs": qjs.Run,
+	"lua": lua.Run,
+	"yq":  yq.Run,
 }
 
 func init() {
